@@ -20,11 +20,13 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/coreos/clair/api"
+	"github.com/coreos/clair/api/context"
 	"github.com/coreos/clair/config"
-	"github.com/coreos/clair/database"
+	"github.com/coreos/clair/database/pgsql"
 	"github.com/coreos/clair/notifier"
 	"github.com/coreos/clair/updater"
 	"github.com/coreos/clair/utils"
@@ -40,28 +42,28 @@ func Boot(config *config.Config) {
 	st := utils.NewStopper()
 
 	// Open database
-	err := database.Open(config.Database)
+	db, err := pgsql.Open(config.Database)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer database.Close()
+	defer db.Close()
 
 	// Start notifier
 	st.Begin()
-	go notifier.Run(config.Notifier, st)
+	go notifier.Run(config.Notifier, db, st)
 
 	// Start API
 	st.Begin()
-	go api.Run(config.API, st)
+	go api.Run(config.API, &context.RouteContext{db, config.API}, st)
 	st.Begin()
-	go api.RunHealth(config.API, st)
+	go api.RunHealth(config.API, &context.RouteContext{db, config.API}, st)
 
 	// Start updater
 	st.Begin()
-	go updater.Run(config.Updater, st)
+	go updater.Run(config.Updater, db, st)
 
 	// Wait for interruption and shutdown gracefully.
-	waitForSignals(os.Interrupt)
+	waitForSignals(syscall.SIGINT, syscall.SIGTERM)
 	log.Info("Received interruption, gracefully stopping ...")
 	st.Stop()
 }

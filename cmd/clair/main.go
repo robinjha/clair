@@ -27,10 +27,22 @@ import (
 
 	// Register components
 	_ "github.com/coreos/clair/notifier/notifiers"
-	_ "github.com/coreos/clair/updater/fetchers"
-	_ "github.com/coreos/clair/worker/detectors/data"
-	_ "github.com/coreos/clair/worker/detectors/os"
-	_ "github.com/coreos/clair/worker/detectors/packages"
+
+	_ "github.com/coreos/clair/updater/fetchers/debian"
+	_ "github.com/coreos/clair/updater/fetchers/rhel"
+	_ "github.com/coreos/clair/updater/fetchers/ubuntu"
+	_ "github.com/coreos/clair/updater/metadata_fetchers/nvd"
+
+	_ "github.com/coreos/clair/worker/detectors/data/aci"
+	_ "github.com/coreos/clair/worker/detectors/data/docker"
+
+	_ "github.com/coreos/clair/worker/detectors/feature/dpkg"
+	_ "github.com/coreos/clair/worker/detectors/feature/rpm"
+
+	_ "github.com/coreos/clair/worker/detectors/namespace/aptsources"
+	_ "github.com/coreos/clair/worker/detectors/namespace/lsbrelease"
+	_ "github.com/coreos/clair/worker/detectors/namespace/osrelease"
+	_ "github.com/coreos/clair/worker/detectors/namespace/redhatrelease"
 )
 
 var log = capnslog.NewPackageLogger("github.com/coreos/clair/cmd/clair", "main")
@@ -38,7 +50,7 @@ var log = capnslog.NewPackageLogger("github.com/coreos/clair/cmd/clair", "main")
 func main() {
 	// Parse command-line arguments
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	flagConfigPath := flag.String("config", "", "Load configuration from the specified file.")
+	flagConfigPath := flag.String("config", "/etc/clair/config.yaml", "Load configuration from the specified file.")
 	flagCPUProfilePath := flag.String("cpu-profile", "", "Write a CPU profile to the specified file before exiting.")
 	flagLogLevel := flag.String("log-level", "info", "Define the logging level.")
 	flag.Parse()
@@ -55,25 +67,30 @@ func main() {
 
 	// Enable CPU Profiling if specified
 	if *flagCPUProfilePath != "" {
-		startCPUProfiling(*flagCPUProfilePath)
-		defer stopCPUProfiling()
+		defer stopCPUProfiling(startCPUProfiling(*flagCPUProfilePath))
 	}
 
 	clair.Boot(config)
 }
 
-func startCPUProfiling(path string) {
+func startCPUProfiling(path string) *os.File {
 	f, err := os.Create(path)
 	if err != nil {
 		log.Fatalf("failed to create profile file: %s", err)
 	}
-	defer f.Close()
 
-	pprof.StartCPUProfile(f)
+	err = pprof.StartCPUProfile(f)
+	if err != nil {
+		log.Fatalf("failed to start CPU profiling: %s", err)
+	}
+
 	log.Info("started CPU profiling")
+
+	return f
 }
 
-func stopCPUProfiling() {
+func stopCPUProfiling(f *os.File) {
 	pprof.StopCPUProfile()
+	f.Close()
 	log.Info("stopped CPU profiling")
 }
