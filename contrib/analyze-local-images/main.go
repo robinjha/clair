@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,10 +46,10 @@ const (
 )
 
 var (
-	endpoint        = flag.String("endpoint", "http://127.0.0.1:6060", "Address to Clair API")
-	myAddress       = flag.String("my-address", "127.0.0.1", "Address from the point of view of Clair")
-	minimumSeverity = flag.String("minimum-severity", "Negligible", "Minimum severity of vulnerabilities to show (Unknown, Negligible, Low, Medium, High, Critical, Defcon1)")
-	colorMode       = flag.String("color", "auto", "Colorize the output (always, auto, never)")
+	flagEndpoint        = flag.String("endpoint", "http://127.0.0.1:6060", "Address to Clair API")
+	flagMyAddress       = flag.String("my-address", "127.0.0.1", "Address from the point of view of Clair")
+	flagMinimumSeverity = flag.String("minimum-severity", "Negligible", "Minimum severity of vulnerabilities to show (Unknown, Negligible, Low, Medium, High, Critical, Defcon1)")
+	flagColorMode       = flag.String("color", "auto", "Colorize the output (always, auto, never)")
 )
 
 type vulnerabilityInfo struct {
@@ -85,6 +86,10 @@ func (s *sorter) Less(i, j int) bool {
 }
 
 func main() {
+	os.Exit(intMain())
+}
+
+func intMain() int {
 	// Parse command-line arguments.
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] image-id\n\nOptions:\n", os.Args[0])
@@ -94,54 +99,89 @@ func main() {
 
 	if len(flag.Args()) != 1 {
 		flag.Usage()
-		os.Exit(1)
+		return 1
 	}
 	imageName := flag.Args()[0]
 
-	minSeverity := types.Priority(*minimumSeverity)
+	minSeverity := types.Priority(*flagMinimumSeverity)
 	if !minSeverity.IsValid() {
 		flag.Usage()
-		os.Exit(1)
+		return 1
 	}
 
-	if *colorMode == "never" {
+	if *flagColorMode == "never" {
 		color.NoColor = true
-	} else if *colorMode == "always" {
+	} else if *flagColorMode == "always" {
 		color.NoColor = false
 	}
 
+	// Create a temporary folder.
+	tmpPath, err := ioutil.TempDir("", "analyze-local-image-")
+	if err != nil {
+		log.Fatalf("Could not create temporary folder: %s", err)
+	}
+	defer os.RemoveAll(tmpPath)
+
+	// Intercept SIGINT / SIGKILl signals.
+	interrupt := make(chan os.Signal)
+	signal.Notify(interrupt, os.Interrupt, os.Kill)
+
+	// Analyze the image.
+	analyzeCh := make(chan error, 1)
+	go func() {
+		analyzeCh <- AnalyzeLocalImage(imageName, minSeverity, *flagEndpoint, *flagMyAddress, tmpPath)
+	}()
+
+	select {
+	case <-interrupt:
+		return 130
+	case err := <-analyzeCh:
+		if err != nil {
+			log.Print(err)
+			return 1
+		}
+	}
+	return 0
+}
+
+func AnalyzeLocalImage(imageName string, minSeverity types.Priority, endpoint, myAddress, tmpPath string) error {
 	// Save image.
 	log.Printf("Saving %s to local disk (this may take some time)", imageName)
-	path, err := save(imageName)
-	defer os.RemoveAll(path)
+	err := save(imageName, tmpPath)
 	if err != nil {
-		fmt.Printf("Could not save image: %s\n", err)
-		os.Exit(1)
+		return fmt.Errorf("Could not save image: %s", err)
 	}
 
 	// Retrieve history.
 	log.Println("Retrieving image history")
-	layerIDs, err := historyFromManifest(path)
+	layerIDs, err := historyFromManifest(tmpPath)
 	if err != nil {
 		layerIDs, err = historyFromCommand(imageName)
 	}
 	if err != nil || len(layerIDs) == 0 {
-		log.Printf("Could not get image's history: %s\n", err)
-		os.Exit(1)
+		return fmt.Errorf("Could not get image's history: %s", err)
 	}
 
 	// Setup a simple HTTP server if Clair is not local.
-	if !strings.Contains(*endpoint, "127.0.0.1") && !strings.Contains(*endpoint, "localhost") {
-		allowedHost := strings.TrimPrefix(*endpoint, "http://")
+	if !strings.Contains(endpoint, "127.0.0.1") && !strings.Contains(endpoint, "localhost") {
+		allowedHost := strings.TrimPrefix(endpoint, "http://")
 		portIndex := strings.Index(allowedHost, ":")
 		if portIndex >= 0 {
 			allowedHost = allowedHost[:portIndex]
 		}
 
-		go listenHTTP(path, allowedHost)
+		log.Printf("Setting up HTTP server (allowing: %s)\n", allowedHost)
 
-		path = "http://" + *myAddress + ":" + strconv.Itoa(httpPort)
-		time.Sleep(200 * time.Millisecond)
+		ch := make(chan error)
+		go listenHTTP(tmpPath, allowedHost, ch)
+		select {
+		case err := <-ch:
+			return fmt.Errorf("An error occured when starting HTTP server: %s", err)
+		case <-time.After(100 * time.Millisecond):
+			break
+		}
+
+		tmpPath = "http://" + myAddress + ":" + strconv.Itoa(httpPort)
 	}
 
 	// Analyze layers.
@@ -149,24 +189,21 @@ func main() {
 	for i := 0; i < len(layerIDs); i++ {
 		log.Printf("Analyzing %s\n", layerIDs[i])
 
-		var err error
 		if i > 0 {
-			err = analyzeLayer(*endpoint, path+"/"+layerIDs[i]+"/layer.tar", layerIDs[i], layerIDs[i-1])
+			err = analyzeLayer(endpoint, tmpPath+"/"+layerIDs[i]+"/layer.tar", layerIDs[i], layerIDs[i-1])
 		} else {
-			err = analyzeLayer(*endpoint, path+"/"+layerIDs[i]+"/layer.tar", layerIDs[i], "")
+			err = analyzeLayer(endpoint, tmpPath+"/"+layerIDs[i]+"/layer.tar", layerIDs[i], "")
 		}
 		if err != nil {
-			log.Printf("Could not analyze layer: %s\n", err)
-			os.Exit(1)
+			return fmt.Errorf("Could not analyze layer: %s", err)
 		}
 	}
 
 	// Get vulnerabilities.
 	log.Println("Retrieving image's vulnerabilities")
-	layer, err := getLayer(*endpoint, layerIDs[len(layerIDs)-1])
+	layer, err := getLayer(endpoint, layerIDs[len(layerIDs)-1])
 	if err != nil {
-		log.Printf("Could not get layer information: %s\n", err)
-		os.Exit(1)
+		return fmt.Errorf("Could not get layer information: %s", err)
 	}
 
 	// Print report.
@@ -174,7 +211,7 @@ func main() {
 
 	if len(layer.Features) == 0 {
 		fmt.Printf("%s No features have been detected in the image. This usually means that the image isn't supported by Clair.\n", color.YellowString("NOTE:"))
-		os.Exit(0)
+		return nil
 	}
 
 	isSafe := true
@@ -231,19 +268,14 @@ func main() {
 
 	if isSafe {
 		fmt.Printf("%s No vulnerabilities were detected in your image\n", color.GreenString("Success!"))
-		os.Exit(0)
 	} else if !hasVisibleVulnerabilities {
 		fmt.Printf("%s No vulnerabilities matching the minimum severity level were detected in your image\n", color.YellowString("NOTE:"))
-		os.Exit(0)
 	}
+
+	return nil
 }
 
-func save(imageName string) (string, error) {
-	path, err := ioutil.TempDir("", "analyze-local-image-")
-	if err != nil {
-		return "", err
-	}
-
+func save(imageName, path string) error {
 	var stderr bytes.Buffer
 	save := exec.Command("docker", "save", imageName)
 	save.Stderr = &stderr
@@ -251,28 +283,28 @@ func save(imageName string) (string, error) {
 	extract.Stderr = &stderr
 	pipe, err := extract.StdinPipe()
 	if err != nil {
-		return "", err
+		return err
 	}
 	save.Stdout = pipe
 
 	err = extract.Start()
 	if err != nil {
-		return "", errors.New(stderr.String())
+		return errors.New(stderr.String())
 	}
 	err = save.Run()
 	if err != nil {
-		return "", errors.New(stderr.String())
+		return errors.New(stderr.String())
 	}
 	err = pipe.Close()
 	if err != nil {
-		return "", err
+		return err
 	}
 	err = extract.Wait()
 	if err != nil {
-		return "", errors.New(stderr.String())
+		return errors.New(stderr.String())
 	}
 
-	return path, nil
+	return nil
 }
 
 func historyFromManifest(path string) ([]string, error) {
@@ -330,9 +362,7 @@ func historyFromCommand(imageName string) ([]string, error) {
 	return layers, nil
 }
 
-func listenHTTP(path, allowedHost string) {
-	log.Printf("Setting up HTTP server (allowing: %s)\n", allowedHost)
-
+func listenHTTP(path, allowedHost string, ch chan error) {
 	restrictedFileServer := func(path, allowedHost string) http.Handler {
 		fc := func(w http.ResponseWriter, r *http.Request) {
 			host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -345,11 +375,7 @@ func listenHTTP(path, allowedHost string) {
 		return http.HandlerFunc(fc)
 	}
 
-	err := http.ListenAndServe(":"+strconv.Itoa(httpPort), restrictedFileServer(path, allowedHost))
-	if err != nil {
-		log.Printf("An error occurs with the HTTP server: %s\n", err)
-		os.Exit(1)
-	}
+	ch <- http.ListenAndServe(":"+strconv.Itoa(httpPort), restrictedFileServer(path, allowedHost))
 }
 
 func analyzeLayer(endpoint, path, layerName, parentLayerName string) error {
